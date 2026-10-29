@@ -1,18 +1,14 @@
 // ==================== IMPORTS ====================
 import http from 'http';
+import fs from 'fs';
 import { chromium } from 'playwright';
 import { initializeApp, cert } from 'firebase-admin/app';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 
-// ==================== FIREBASE ====================
-const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
-initializeApp({ credential: cert(serviceAccount) });
-const db = getFirestore();
-
 // ==================== KONFİQ ====================
 const CHC_URL  = 'https://chcgreen.net';
-const CHC_USER = process.env.CHC_USER || 'Ayl22';
-const CHC_PASS = process.env.CHC_PASS || 'Qwerty1234@';
+const CHC_USER = process.env.CHC_USER;
+const CHC_PASS = process.env.CHC_PASS;
 const TICK_MS  = 5000;
 const SYNC_ALL_EVERY = 30000;
 const PORT = process.env.PORT || 3000;
@@ -20,9 +16,70 @@ const PORT = process.env.PORT || 3000;
 let browser = null, context = null, page = null;
 let lastLoginMs = 0;
 let lastFullSyncMs = 0;
+let db = null;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// ==================== HTTP SERVER (ilk başlayır ki Render portu görsün) ====================
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    ok: true,
+    bot: 'chcgreen-bot',
+    uptime: Math.floor(process.uptime()),
+    firebase: !!db,
+    lastLogin: lastLoginMs ? new Date(lastLoginMs).toISOString() : null,
+    time: new Date().toISOString()
+  }));
+});
+server.listen(PORT, '0.0.0.0', () => {
+  log(`🌐 HTTP server port ${PORT}-də işləyir`);
+});
+
+// ==================== FIREBASE ====================
+function loadServiceAccount() {
+  let raw = process.env.FIREBASE_CREDENTIALS;
+
+  // Secret File variantı (Render → Secret Files → firebase.json)
+  if (!raw) {
+    for (const p of ['/etc/secrets/firebase.json', './firebase.json']) {
+      if (fs.existsSync(p)) { raw = fs.readFileSync(p, 'utf8'); break; }
+    }
+  }
+
+  if (!raw) {
+    throw new Error(
+      'FIREBASE_CREDENTIALS tapılmadı. Render → Environment bölməsinə ' +
+      'service account JSON-u əlavə edin (və ya Secret File: firebase.json).'
+    );
+  }
+
+  raw = raw.trim();
+  // base64 ilə verilibsə
+  if (!raw.startsWith('{')) {
+    try { raw = Buffer.from(raw, 'base64').toString('utf8'); } catch (_) {}
+  }
+
+  let sa;
+  try {
+    sa = JSON.parse(raw);
+  } catch (e) {
+    throw new Error('FIREBASE_CREDENTIALS düzgün JSON deyil: ' + e.message);
+  }
+
+  if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, '\n');
+  if (!sa.project_id || !sa.client_email || !sa.private_key) {
+    throw new Error('Service account JSON-da project_id / client_email / private_key çatışmır');
+  }
+  return sa;
+}
+
+function initFirebase() {
+  initializeApp({ credential: cert(loadServiceAccount()) });
+  db = getFirestore();
+  log('🔥 Firebase qoşuldu');
+}
 
 // ==================== LOGIN ====================
 async function ensureLoggedIn() {
@@ -31,10 +88,10 @@ async function ensureLoggedIn() {
     try {
       const url = page.url();
       if (url.includes('/invoice') || url.includes('/manage')) return;
-    } catch(_) {}
+    } catch (_) {}
   }
 
-  if (browser) { try { await browser.close(); } catch(_){} }
+  if (browser) { try { await browser.close(); } catch (_) {} }
 
   log('🔐 Login...');
   browser = await chromium.launch({
@@ -72,7 +129,6 @@ async function createInvoice(amount) {
   log(`📝 Invoice yaradılır: ${amount} AZN`);
 
   await page.goto(`${CHC_URL}/invoice/new`, { waitUntil: 'domcontentloaded' });
-
   await page.fill('#amount', String(amount));
 
   await Promise.all([
@@ -175,7 +231,7 @@ async function processCodeRequests() {
           error: e.message.slice(0, 300),
           failedAt: FieldValue.serverTimestamp()
         });
-      } catch(_) {}
+      } catch (_) {}
     }
   }
 }
@@ -212,7 +268,7 @@ async function processSyncRequests() {
       log(`🔄 Sync ${uid} → ${bal.amount} AZN`);
     } catch (e) {
       log(`❌ Sync xətası ${uid}:`, e.message);
-      try { await doc.ref.delete(); } catch(_) {}
+      try { await doc.ref.delete(); } catch (_) {}
     }
   }
 }
@@ -259,7 +315,13 @@ async function syncAllTracking() {
 // ==================== MAIN LOOP ====================
 async function main() {
   log('🤖 Bot işə düşdü');
-  try { await ensureLoggedIn(); } catch(e){ log('⚠️ İlk login:', e.message); }
+
+  if (!CHC_USER || !CHC_PASS) {
+    throw new Error('CHC_USER və CHC_PASS environment dəyişənləri təyin olunmayıb');
+  }
+  initFirebase();
+
+  try { await ensureLoggedIn(); } catch (e) { log('⚠️ İlk login:', e.message); }
 
   while (true) {
     try {
@@ -268,9 +330,9 @@ async function main() {
       await syncAllTracking();
     } catch (e) {
       log('❌ Loop xətası:', e.message);
-      if (/Login|security_check|Navigation/i.test(e.message)) {
+      if (/Login|security_check|Navigation|browser|Target closed/i.test(e.message)) {
         lastLoginMs = 0;
-        try { await browser.close(); } catch(_){}
+        try { await browser.close(); } catch (_) {}
         browser = null; page = null;
       }
     }
@@ -278,21 +340,6 @@ async function main() {
   }
 }
 
-// ==================== HTTP SERVER ====================
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    ok: true,
-    bot: 'chcgreen-bot',
-    uptime: Math.floor(process.uptime()),
-    lastLogin: lastLoginMs ? new Date(lastLoginMs).toISOString() : null,
-    time: new Date().toISOString()
-  }));
-});
-
-server.listen(PORT, () => {
-  log(`🌐 HTTP server port ${PORT}-də işləyir`);
-});
-
 // ==================== START ====================
-main().catch(e => { console.error('FATAL:', e); process.exit(1); });
+process.on('unhandledRejection', e => console.error('UNHANDLED:', e));
+main().catch(e => { console.error('FATAL:', e.message); process.exit(1); });
