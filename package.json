@@ -4,8 +4,7 @@
   "type": "module",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "postinstall": "playwright install chromium"
+    "start": "node bot.js"
   },
   "dependencies": {
     "playwright": "^1.48.0",
