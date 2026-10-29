@@ -9,65 +9,55 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 const CHC_URL  = 'https://chcgreen.net';
 const CHC_USER = process.env.CHC_USER;
 const CHC_PASS = process.env.CHC_PASS;
-const TICK_MS  = 5000;
-const SYNC_ALL_EVERY = 30000;
-const PORT = process.env.PORT || 3000;
+const PORT     = process.env.PORT || 3000;
+
+const MIN_AMOUNT = 3;       // saytdakı minimumla eyni
+const MAX_AMOUNT = 2000;    // saytdakı CODE_MAX_AZN ilə eyni
+const STALE_PROCESSING_MS = 2 * 60_000;
 
 let browser = null, context = null, page = null;
 let lastLoginMs = 0;
-let lastFullSyncMs = 0;
 let db = null;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 
-// ==================== HTTP SERVER (ilk başlayır ki Render portu görsün) ====================
-const server = http.createServer((req, res) => {
+// ==================== HTTP SERVER (Render portu görsün + "oyatma" üçün) ====================
+const queue = [];
+const queued = new Set();
+let working = false;
+
+http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     ok: true,
     bot: 'chcgreen-bot',
-    uptime: Math.floor(process.uptime()),
     firebase: !!db,
+    queue: queue.length,
+    working,
+    uptime: Math.floor(process.uptime()),
     lastLogin: lastLoginMs ? new Date(lastLoginMs).toISOString() : null,
     time: new Date().toISOString()
   }));
-});
-server.listen(PORT, '0.0.0.0', () => {
-  log(`🌐 HTTP server port ${PORT}-də işləyir`);
-});
+}).listen(PORT, '0.0.0.0', () => log(`🌐 HTTP server port ${PORT}-də işləyir`));
 
 // ==================== FIREBASE ====================
 function loadServiceAccount() {
   let raw = process.env.FIREBASE_CREDENTIALS;
-
-  // Secret File variantı (Render → Secret Files → firebase.json)
   if (!raw) {
     for (const p of ['/etc/secrets/firebase.json', './firebase.json']) {
       if (fs.existsSync(p)) { raw = fs.readFileSync(p, 'utf8'); break; }
     }
   }
-
-  if (!raw) {
-    throw new Error(
-      'FIREBASE_CREDENTIALS tapılmadı. Render → Environment bölməsinə ' +
-      'service account JSON-u əlavə edin (və ya Secret File: firebase.json).'
-    );
-  }
-
+  if (!raw) throw new Error('FIREBASE_CREDENTIALS tapılmadı (Render → Environment)');
   raw = raw.trim();
-  // base64 ilə verilibsə
   if (!raw.startsWith('{')) {
     try { raw = Buffer.from(raw, 'base64').toString('utf8'); } catch (_) {}
   }
-
   let sa;
-  try {
-    sa = JSON.parse(raw);
-  } catch (e) {
-    throw new Error('FIREBASE_CREDENTIALS düzgün JSON deyil: ' + e.message);
-  }
-
+  try { sa = JSON.parse(raw); }
+  catch (e) { throw new Error('FIREBASE_CREDENTIALS düzgün JSON deyil: ' + e.message); }
   if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, '\n');
   if (!sa.project_id || !sa.client_email || !sa.private_key) {
     throw new Error('Service account JSON-da project_id / client_email / private_key çatışmır');
@@ -76,9 +66,10 @@ function loadServiceAccount() {
 }
 
 function initFirebase() {
-  initializeApp({ credential: cert(loadServiceAccount()) });
+  const sa = loadServiceAccount();
+  initializeApp({ credential: cert(sa) });
   db = getFirestore();
-  log('🔥 Firebase qoşuldu');
+  log('🔥 Firebase qoşuldu → project:', sa.project_id);
 }
 
 // ==================== LOGIN ====================
@@ -92,6 +83,7 @@ async function ensureLoggedIn() {
   }
 
   if (browser) { try { await browser.close(); } catch (_) {} }
+  browser = null; context = null; page = null;
 
   log('🔐 Login...');
   browser = await chromium.launch({
@@ -116,230 +108,270 @@ async function ensureLoggedIn() {
 
   const url = page.url();
   if (url.includes('security_check') || url.toLowerCase().includes('login')) {
-    throw new Error('Login alınmadı — kredensiallar yanlışdır');
+    throw new Error('Login alınmadı — CHC_USER / CHC_PASS yanlışdır');
   }
 
   lastLoginMs = Date.now();
   log('✅ Login OK');
 }
 
-// ==================== YENİ INVOICE ====================
-async function createInvoice(amount) {
-  await ensureLoggedIn();
-  log(`📝 Invoice yaradılır: ${amount} AZN`);
+async function resetBrowser() {
+  lastLoginMs = 0;
+  try { if (browser) await browser.close(); } catch (_) {}
+  browser = null; context = null; page = null;
+}
 
-  await page.goto(`${CHC_URL}/invoice/new`, { waitUntil: 'domcontentloaded' });
-  await page.fill('#amount', String(amount));
-
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'networkidle' }),
-    page.click('input[value="Save"]')
-  ]);
-
-  const latest = await page.evaluate(() => {
-    const rows = document.querySelectorAll('#invoices tbody tr');
-    for (const row of rows) {
-      if (!row.classList.contains('in')) continue;
+// ==================== INVOICE SİYAHISI ====================
+async function readInvoices() {
+  return await page.evaluate(() => {
+    const out = [];
+    document.querySelectorAll('#invoices tbody tr').forEach(row => {
+      const idInput    = row.querySelector('input[name="_chk"]');
       const amountCell = row.querySelector('td.actions');
       const codeLink   = row.querySelector('td:nth-child(5) a');
-      const idInput    = row.querySelector('input[name="_chk"]');
-      if (!codeLink || !amountCell) continue;
-      const amt = parseFloat(amountCell.textContent) || 0;
-      if (amt <= 0) continue;
-      return {
-        code: codeLink.textContent.trim(),
-        invoiceId: idInput ? idInput.value : null,
-        amount: amt
-      };
-    }
-    return null;
+      out.push({
+        id: idInput ? idInput.value : null,
+        code: codeLink ? codeLink.textContent.trim() : null,
+        amount: parseFloat(amountCell ? amountCell.textContent : '0') || 0,
+        isIn: row.classList.contains('in')
+      });
+    });
+    return out;
   });
-
-  if (!latest || !latest.code || !latest.invoiceId) {
-    throw new Error('Kod tapılmadı (list boş və ya struktur dəyişib)');
-  }
-  log(`✅ Kod: ${latest.code} | ID: ${latest.invoiceId} | Balans: ${latest.amount}`);
-  return latest;
 }
 
-// ==================== INVOICE BALANSINI OXU ====================
-async function getInvoiceBalance(invoiceId) {
-  await ensureLoggedIn();
-  await page.goto(`${CHC_URL}/invoice/list`, { waitUntil: 'domcontentloaded' });
+// ==================== YENİ INVOICE (kod) ====================
+// e.safe === true  → "Save" basılmamışdı, invoice yaranmayıb, pul təhlükəsiz qaytarıla bilər
+// e.safe === false → "Save" basılıb, invoice yaranmış ola bilər, admin yoxlamalıdır
+async function createInvoice(amount) {
+  let saved = false;
+  try {
+    await ensureLoggedIn();
+    log(`📝 Invoice yaradılır: ${amount} AZN`);
 
-  return await page.evaluate((id) => {
-    const rows = document.querySelectorAll('#invoices tbody tr');
-    for (const row of rows) {
-      const idInput = row.querySelector('input[name="_chk"]');
-      if (!idInput || idInput.value !== id) continue;
-      const amountCell = row.querySelector('td.actions');
-      const amount = parseFloat(amountCell ? amountCell.textContent : '0') || 0;
-      return {
-        exists: true,
-        amount,
-        isIn: row.classList.contains('in'),
-        isOut: row.classList.contains('out')
-      };
+    // Əvvəlki invoice-ların ID-ləri (yenisini dəqiq tapmaq üçün)
+    await page.goto(`${CHC_URL}/invoice/list`, { waitUntil: 'domcontentloaded' });
+    const before = new Set((await readInvoices()).map(r => r.id).filter(Boolean));
+
+    await page.goto(`${CHC_URL}/invoice/new`, { waitUntil: 'domcontentloaded' });
+    await page.fill('#amount', String(amount));
+
+    saved = true; // bundan sonrakı hər xəta "qeyri-müəyyən" sayılır
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle' }),
+      page.click('input[value="Save"]')
+    ]);
+
+    let rows = await readInvoices();
+    if (!rows.length) {
+      await page.goto(`${CHC_URL}/invoice/list`, { waitUntil: 'domcontentloaded' });
+      rows = await readInvoices();
     }
-    return { exists: false, amount: 0, isIn: false, isOut: false };
-  }, String(invoiceId));
+
+    const fresh = rows.find(r => r.id && !before.has(r.id) && r.isIn && r.code && r.amount > 0);
+    if (!fresh) throw new Error('Yeni invoice/kod tapılmadı (struktur dəyişib?)');
+
+    if (Math.abs(fresh.amount - amount) > 0.01) {
+      log(`⚠️ Məbləğ fərqlidir: istənilən ${amount}, saytda ${fresh.amount}`);
+    }
+    log(`✅ Kod: ${fresh.code} | ID: ${fresh.id} | Məbləğ: ${fresh.amount}`);
+    return { code: fresh.code, invoiceId: String(fresh.id), amount: fresh.amount };
+  } catch (e) {
+    e.safe = !saved;
+    await resetBrowser();
+    throw e;
+  }
 }
 
-// ==================== KOD SORĞULARINI İŞLƏ ====================
-async function processCodeRequests() {
-  const snap = await db.collection('chcgreenRequests')
-    .where('status', '==', 'pending')
-    .limit(5)
-    .get();
+// ==================== FIRESTORE KÖMƏKÇİLƏR ====================
+async function claim(ref) {
+  return await db.runTransaction(async tx => {
+    const s = await tx.get(ref);
+    if (!s.exists || s.data().status !== 'pending') return null;
+    tx.update(ref, { status: 'processing', startedAt: FieldValue.serverTimestamp() });
+    return s.data();
+  });
+}
 
-  for (const doc of snap.docs) {
-    const data = doc.data();
-    try {
-      await doc.ref.update({ status: 'processing', startedAt: FieldValue.serverTimestamp() });
+async function deliver(ref, id, data, result) {
+  const batch = db.batch();
+  batch.set(db.collection('users').doc(data.uid).collection('codes').doc('req_' + id), {
+    code: result.code,
+    platform: data.platform || 'fastloto',
+    amount: Number(data.amount),
+    source: 'chcgreen',
+    status: 'active',
+    createdAt: FieldValue.serverTimestamp()
+  });
+  batch.update(ref, {
+    status: 'delivered',
+    code: result.code,
+    invoiceId: result.invoiceId,
+    deliveredAt: FieldValue.serverTimestamp()
+  });
+  await batch.commit();
+}
 
-      const result = await createInvoice(Number(data.amount));
-
-      await doc.ref.update({
-        status: 'delivered',
-        code: result.code,
-        invoiceId: result.invoiceId,
-        deliveredAt: FieldValue.serverTimestamp()
-      });
-
-      await db.collection('users').doc(data.uid).update({
-        chcgreenInvoiceId: result.invoiceId,
-        chcgreenTracking: true,
-        chcgreenLastSync: FieldValue.serverTimestamp(),
-        balance: result.amount
-      });
-
-      await db.collection('users').doc(data.uid).collection('codes').add({
-        code: result.code,
-        platform: data.platform || 'fastloto',
-        amount: Number(data.amount),
-        source: 'chcgreen',
-        status: 'active',
+// Pulu istifadəçiyə qaytarır (yalnız invoice YARANMAYIBSA)
+async function refund(ref, id, data, reason) {
+  const amount = r2(data.amount);
+  await db.runTransaction(async tx => {
+    const rs = await tx.get(ref);
+    if (!rs.exists || rs.data().refunded) return;
+    const uRef = db.collection('users').doc(data.uid);
+    const us = await tx.get(uRef);
+    if (us.exists) {
+      tx.update(uRef, { balance: r2((Number(us.data().balance) || 0) + amount) });
+      tx.set(uRef.collection('history').doc('refund_' + id), {
+        type: 'deposit',
+        amount,
+        description: (data.platform || 'fastloto').toUpperCase() + ' kod — texniki xəta, məbləğ qaytarıldı',
         createdAt: FieldValue.serverTimestamp()
       });
-
-      log(`✅ ${data.uid} → ${result.code}`);
-    } catch (e) {
-      log(`❌ Sorğu xətası ${doc.id}:`, e.message);
-      try {
-        await doc.ref.update({
-          status: 'failed',
-          error: e.message.slice(0, 300),
-          failedAt: FieldValue.serverTimestamp()
-        });
-      } catch (_) {}
     }
-  }
+    tx.update(ref, {
+      status: 'failed',
+      refunded: true,
+      error: String(reason).slice(0, 300),
+      failedAt: FieldValue.serverTimestamp()
+    });
+  });
+  log(`↩️ Qaytarıldı ${amount} AZN → ${data.uid} (${reason})`);
 }
 
-// ==================== SINXRON İSTƏKLƏRİ ====================
-async function processSyncRequests() {
-  const snap = await db.collection('chcgreenSync').limit(10).get();
-  if (snap.empty) return;
-
-  for (const doc of snap.docs) {
-    const uid = doc.id;
+// Qeyri-müəyyən hal: admin paneldə "Texniki xəta" bölməsinə düşür
+async function markReview(ref, id, data, stage, reason, extra = {}) {
+  try {
+    await ref.update({
+      status: 'review',
+      error: String(reason).slice(0, 300),
+      failedAt: FieldValue.serverTimestamp(),
+      ...extra
+    });
+  } catch (_) {}
+  try {
+    let userName = '', userId = String(data.userId || '');
     try {
-      const uSnap = await db.collection('users').doc(uid).get();
-      if (!uSnap.exists) { await doc.ref.delete(); continue; }
-      const u = uSnap.data();
-      if (!u.chcgreenInvoiceId || u.chcgreenTracking === false) {
-        await doc.ref.delete();
-        continue;
-      }
-      const bal = await getInvoiceBalance(u.chcgreenInvoiceId);
-      if (!bal.exists || bal.isOut || bal.amount <= 0) {
-        await db.collection('users').doc(uid).update({
-          balance: 0,
-          chcgreenTracking: false,
-          chcgreenLastSync: FieldValue.serverTimestamp()
-        });
-      } else {
-        await db.collection('users').doc(uid).update({
-          balance: bal.amount,
-          chcgreenLastSync: FieldValue.serverTimestamp()
-        });
-      }
-      await doc.ref.delete();
-      log(`🔄 Sync ${uid} → ${bal.amount} AZN`);
-    } catch (e) {
-      log(`❌ Sync xətası ${uid}:`, e.message);
-      try { await doc.ref.delete(); } catch (_) {}
+      const u = await db.collection('users').doc(data.uid).get();
+      if (u.exists) { userName = u.data().displayName || ''; userId = String(u.data().uniqueId || userId); }
+    } catch (_) {}
+    await db.collection('failedOps').add({
+      uid: data.uid || '',
+      userId,
+      userName,
+      kind: 'code_purchase',
+      platform: String(data.platform || 'fastloto'),
+      amount: Number(data.amount) || 0,
+      stage,
+      charged: true,
+      poolId: '',
+      error: String(reason).slice(0, 300),
+      status: 'new',
+      createdAt: FieldValue.serverTimestamp()
+    });
+  } catch (e) { log('failedOps yazılmadı:', e.message); }
+  log(`⚠️ Admin yoxlamalıdır: ${id} (${stage}: ${reason})`);
+}
+
+// ==================== BİR SORĞUNU İŞLƏ ====================
+async function handle(id) {
+  const ref = db.collection('chcgreenRequests').doc(id);
+  const data = await claim(ref);
+  if (!data) return; // başqası götürüb və ya artıq pending deyil
+
+  const amount = Number(data.amount);
+  if (!data.uid || !Number.isFinite(amount) || amount < MIN_AMOUNT || amount > MAX_AMOUNT) {
+    await markReview(ref, id, data, 'invalid_request', 'Yanlış sorğu məlumatı');
+    return;
+  }
+
+  log(`▶️ Sorğu ${id}: ${data.uid} → ${amount} AZN (${data.platform || 'fastloto'})`);
+
+  let result;
+  try {
+    result = await createInvoice(amount);
+  } catch (e) {
+    log(`❌ ${id}:`, e.message);
+    if (e.safe) {
+      try { await refund(ref, id, data, e.message); }
+      catch (e2) { await markReview(ref, id, data, 'refund_failed', e2.message); }
+    } else {
+      await markReview(ref, id, data, 'after_save', e.message);
+    }
+    return;
+  }
+
+  try {
+    await deliver(ref, id, data, result);
+    log(`✅ Çatdırıldı: ${data.uid} → ${result.code}`);
+  } catch (e) {
+    // Kod var, amma Firestore-a yazılmadı → bir də cəhd, olmasa admin
+    try { await sleep(1500); await deliver(ref, id, data, result); log(`✅ Çatdırıldı (2-ci cəhd): ${result.code}`); }
+    catch (e2) {
+      await markReview(ref, id, data, 'deliver_failed', e2.message, { code: result.code, invoiceId: result.invoiceId });
     }
   }
 }
 
-// ==================== BÜTÜN TRACKING İSTİFADƏÇİLƏR ====================
-async function syncAllTracking() {
-  if (Date.now() - lastFullSyncMs < SYNC_ALL_EVERY) return;
-  lastFullSyncMs = Date.now();
-
-  const snap = await db.collection('users')
-    .where('chcgreenTracking', '==', true)
-    .limit(50)
-    .get();
-
-  if (snap.empty) return;
-  log(`🔄 Tam sync: ${snap.size} istifadəçi`);
-
-  for (const userDoc of snap.docs) {
-    const u = userDoc.data();
-    if (!u.chcgreenInvoiceId) continue;
-    try {
-      const bal = await getInvoiceBalance(u.chcgreenInvoiceId);
-      if (!bal.exists || bal.isOut || bal.amount <= 0) {
-        await userDoc.ref.update({
-          balance: 0,
-          chcgreenTracking: false,
-          chcgreenLastSync: FieldValue.serverTimestamp()
-        });
-      } else if (Number(u.balance) !== bal.amount) {
-        await userDoc.ref.update({
-          balance: bal.amount,
-          chcgreenLastSync: FieldValue.serverTimestamp()
-        });
-      } else {
-        await userDoc.ref.update({ chcgreenLastSync: FieldValue.serverTimestamp() });
-      }
-    } catch (e) {
-      log(`⚠️ ${userDoc.id}:`, e.message);
-    }
-    await sleep(500);
-  }
+// ==================== NÖVBƏ ====================
+function enqueue(id) {
+  if (queued.has(id)) return;
+  queued.add(id);
+  queue.push(id);
 }
 
-// ==================== MAIN LOOP ====================
-async function main() {
-  log('🤖 Bot işə düşdü');
-
-  if (!CHC_USER || !CHC_PASS) {
-    throw new Error('CHC_USER və CHC_PASS environment dəyişənləri təyin olunmayıb');
-  }
-  initFirebase();
-
-  try { await ensureLoggedIn(); } catch (e) { log('⚠️ İlk login:', e.message); }
-
+async function worker() {
   while (true) {
-    try {
-      await processCodeRequests();
-      await processSyncRequests();
-      await syncAllTracking();
-    } catch (e) {
-      log('❌ Loop xətası:', e.message);
-      if (/Login|security_check|Navigation|browser|Target closed/i.test(e.message)) {
-        lastLoginMs = 0;
-        try { await browser.close(); } catch (_) {}
-        browser = null; page = null;
+    const id = queue.shift();
+    if (!id) { await sleep(400); continue; }
+    queued.delete(id);
+    working = true;
+    try { await handle(id); }
+    catch (e) { log('❌ Worker xətası:', e.message); }
+    working = false;
+  }
+}
+
+function listen() {
+  db.collection('chcgreenRequests')
+    .where('status', '==', 'pending')
+    .onSnapshot(
+      snap => snap.docChanges().forEach(ch => {
+        if (ch.type === 'added' || ch.type === 'modified') enqueue(ch.doc.id);
+      }),
+      err => {
+        log('❌ Listener xətası:', err.message, '→ 5 san sonra yenidən');
+        setTimeout(listen, 5000);
+      }
+    );
+  log('👂 chcgreenRequests dinlənilir');
+}
+
+// Bot çöküb "processing"-də qalmış sorğular → admin yoxlasın (təkrar kod verməmək üçün)
+async function recoverStale() {
+  try {
+    const snap = await db.collection('chcgreenRequests').where('status', '==', 'processing').get();
+    for (const d of snap.docs) {
+      const data = d.data();
+      const started = data.startedAt && data.startedAt.toMillis ? data.startedAt.toMillis() : 0;
+      if (Date.now() - started > STALE_PROCESSING_MS) {
+        await markReview(d.ref, d.id, data, 'bot_restart', 'Bot sorğu işlənərkən dayanıb');
       }
     }
-    await sleep(TICK_MS);
-  }
+  } catch (e) { log('recoverStale:', e.message); }
 }
 
 // ==================== START ====================
+async function main() {
+  log('🤖 Bot işə düşdü');
+  if (!CHC_USER || !CHC_PASS) throw new Error('CHC_USER və CHC_PASS təyin olunmayıb (Render → Environment)');
+  initFirebase();
+  await recoverStale();
+  worker();
+  listen();
+  // Login-i əvvəlcədən et ki, ilk sorğu tez getsin (alınmasa sorğu gələndə yenidən cəhd olunur)
+  try { await ensureLoggedIn(); } catch (e) { log('⚠️ İlk login:', e.message); await resetBrowser(); }
+}
+
 process.on('unhandledRejection', e => console.error('UNHANDLED:', e));
 main().catch(e => { console.error('FATAL:', e.message); process.exit(1); });
