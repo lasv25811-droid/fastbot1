@@ -1,0 +1,14 @@
+{
+  "name": "chcgreen-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0",
+    "firebase-admin": "^13.0.0"
+  }
+}
